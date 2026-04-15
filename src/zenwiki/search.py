@@ -193,17 +193,43 @@ class WikiIndex:
         """)
         conn.commit()
 
+    # Frontmatter fields that declare what a page is ABOUT. Maps list the
+    # concepts/entities they cover; comparisons list subjects; concepts list
+    # related concepts; summaries list key_sources. Without folding these
+    # into the FTS index, a map titled "FICC AI Research Landscape" tagged
+    # [ficc, ai投研] won't surface for the query "FICC AI 投研" because the
+    # body is just wikilinks. Including them fixes cross-lingual titles and
+    # raises map/comparison recall without per-path boosting.
+    _SEMANTIC_FRONTMATTER_FIELDS = (
+        "tags",
+        "aliases",
+        "key_concepts",
+        "key_entities",
+        "subjects",
+        "key_sources",
+        "related_concepts",
+        "category",
+    )
+
     def _index_file(self, rel_path: str, full_path: Path, conn: sqlite3.Connection) -> None:
         text = full_path.read_text(encoding="utf-8")
         fm = parse_frontmatter(text)
         body = strip_frontmatter(text)
 
         title = fm.get("title", "")
-        aliases = fm.get("aliases", [])
-        if isinstance(aliases, str):
-            aliases = [aliases]
 
-        title_text = " ".join([title] + aliases) if aliases else title
+        # Flatten semantic frontmatter fields into a space-separated string
+        # that joins the raw title. This text is fed to BOTH the title column
+        # (5x BM25 weight) and the tokens column (full-text).
+        semantic_terms: list[str] = []
+        for key in self._SEMANTIC_FRONTMATTER_FIELDS:
+            val = fm.get(key)
+            if isinstance(val, list):
+                semantic_terms.extend(str(v) for v in val if v)
+            elif isinstance(val, str) and val:
+                semantic_terms.append(val)
+
+        title_text = " ".join([title] + semantic_terms).strip() if semantic_terms else title
         indexable = f"{title_text}\n{body}"
         tokens = _tokenize(indexable)
         token_str = " ".join(tokens)
@@ -294,28 +320,41 @@ class WikiIndex:
 
         return result
 
-    def search(self, query: str, limit: int = 10) -> list[SearchResult]:
-        """Search the wiki, returning ranked results."""
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        path_prefix: str | None = None,
+    ) -> list[SearchResult]:
+        """Search the wiki, returning ranked results.
+
+        `path_prefix` restricts to paths starting with the given prefix
+        (e.g. "maps/"). Used by hybrid_search to guarantee map/comparison
+        representation.
+        """
         tokens = _tokenize(query)
         if not tokens:
             return []
 
         fts_query = " OR ".join(f'"{t}"' for t in tokens)
 
+        sql = """
+            SELECT f.path, bm25(wiki_fts, 5.0, 3.0, 1.0) AS rank,
+                   m.snippet
+            FROM wiki_fts f
+            JOIN wiki_meta m ON f.path = m.path
+            WHERE wiki_fts MATCH ?
+        """
+        params: list[object] = [fts_query]
+        if path_prefix:
+            sql += " AND f.path LIKE ?"
+            params.append(f"{path_prefix}%")
+        sql += " ORDER BY rank LIMIT ?"
+        params.append(limit)
+
         conn = self._get_conn()
         try:
-            rows = conn.execute(
-                """
-                SELECT f.path, bm25(wiki_fts, 5.0, 3.0, 1.0) AS rank,
-                       m.snippet
-                FROM wiki_fts f
-                JOIN wiki_meta m ON f.path = m.path
-                WHERE wiki_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (fts_query, limit),
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         except sqlite3.OperationalError:
             return []
 
@@ -364,17 +403,73 @@ class WikiIndex:
 
     def hybrid_search(self, query: str, limit: int = 10) -> list[SearchResult]:
         """Hybrid search: BM25 keyword + vector semantic, merged via RRF.
-        Falls back to BM25-only if qmd is unavailable or fails."""
+        Falls back to BM25-only if qmd is unavailable or fails.
+
+        After the merge, reserves at most one slot for the best-matching
+        `maps/` page and one for the best `comparisons/` page if those
+        match the query at all. Map and comparison pages are "directory-
+        style" (short body, long frontmatter) and consistently under-rank
+        on raw BM25, yet they're the highest-value sources for cross-
+        cutting questions like "what products cover X?". The hard slot
+        corrects for this structural bias without distorting ordering
+        for specific lookups (where neither type will match).
+        """
         bm25_results = self.search(query, limit=limit * 2)
 
         if not self._qmd:
-            return bm25_results[:limit]
+            base = bm25_results[:limit]
+        else:
+            vec_results = self.vsearch(query, limit=limit * 2)
+            if not vec_results:
+                base = bm25_results[:limit]
+            else:
+                base = _rrf_merge(bm25_results, vec_results, limit=limit)
 
-        vec_results = self.vsearch(query, limit=limit * 2)
-        if not vec_results:
-            return bm25_results[:limit]
+        return self._promote_type_pages(base, query, limit)
 
-        return _rrf_merge(bm25_results, vec_results, limit=limit)
+    # Page prefixes that earn a guaranteed slot in hybrid_search results
+    # when they match the query at all. Order matters: the first promoted
+    # type displaces the last non-privileged slot, the second displaces
+    # the next-last, and so on.
+    _PROMOTE_PREFIXES = ("maps/", "comparisons/")
+
+    def _promote_type_pages(
+        self,
+        base: list[SearchResult],
+        query: str,
+        limit: int,
+    ) -> list[SearchResult]:
+        """If `base` lacks any maps/ or comparisons/ page, and such a page
+        matches the query, swap it in for the lowest-ranked non-privileged
+        slot. Idempotent — already-present privileged pages are untouched."""
+        have_paths = {r.path for r in base}
+        promoted = list(base)
+
+        for prefix in self._PROMOTE_PREFIXES:
+            if any(p.startswith(prefix) for p in have_paths):
+                continue
+            top = self.search(query, limit=1, path_prefix=prefix)
+            if not top:
+                continue
+            candidate = top[0]
+            # Find the lowest-ranked slot NOT held by a privileged prefix,
+            # walking from the bottom. This preserves higher-ranked normal
+            # results and still caps total size at `limit`.
+            for idx in range(len(promoted) - 1, -1, -1):
+                if not any(
+                    promoted[idx].path.startswith(p)
+                    for p in self._PROMOTE_PREFIXES
+                ):
+                    promoted[idx] = candidate
+                    have_paths.add(candidate.path)
+                    break
+            else:
+                # Base is shorter than limit or all slots privileged — append.
+                if len(promoted) < limit:
+                    promoted.append(candidate)
+                    have_paths.add(candidate.path)
+
+        return promoted[:limit]
 
     def close(self) -> None:
         if self._conn:

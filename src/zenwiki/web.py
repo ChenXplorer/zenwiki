@@ -125,14 +125,18 @@ def create_app(root: Path) -> FastAPI:
     @api.get("/query")
     async def query_endpoint(q: str = Query(..., min_length=1)) -> JSONResponse:
         """Search + AI answer: retrieve relevant wiki pages, then ask Agent CLI to synthesize."""
-        results = _wiki_index.hybrid_search(q, limit=5)
+        # Retrieve 10 (not 5) so cross-cutting pages like maps/ and
+        # comparisons/ — which often rank 6-10 under BM25 because they list
+        # many entities rather than repeat query tokens — still make it into
+        # the prompt.
+        results = _wiki_index.hybrid_search(q, limit=10)
 
         if not results:
             return JSONResponse({"answer": "", "sources": [], "results": []})
 
         pages_content: list[str] = []
         sources: list[str] = []
-        for r in results[:5]:
+        for r in results[:10]:
             wiki_path = root / "wiki" / r.path
             if not wiki_path.exists():
                 continue
