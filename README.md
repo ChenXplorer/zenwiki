@@ -272,12 +272,16 @@ The search bar in the Web UI is a single **Ask AI** flow:
 ```
 User question
   → SQLite FTS5 (BM25) + qmd vsearch (if qmd is installed), merged via RRF
-  → top-5 wiki pages fetched (deprecated pages filtered out)
+  → top-10 wiki pages fetched (deprecated pages filtered out)
   → Agent CLI synthesizes an answer via subprocess (codex exec | claude -p --bare)
   → returned with source citations
 ```
 
 There is no separate keyword-search button: every query goes through Ask AI. A plain `zenwiki search "<q>"` CLI remains available for scripting.
+
+**Retrieval biases tuned for the Karpathy pattern:**
+- Semantic frontmatter fields (`tags`, `key_concepts`, `key_entities`, `subjects`, `key_sources`, `related_concepts`, `category`) are folded into the FTS title column (BM25 weight 5.0). This fixes the common case where a map page has an English title but Chinese tags (or vice versa) — its declared coverage becomes searchable.
+- `maps/` and `comparisons/` pages get a **hard slot** in hybrid search results: if at least one matches the query but neither made the RRF top-10, the best match of each prefix is swapped in. This corrects for the structural BM25 disadvantage of directory-style pages (short body, long frontmatter lists) and ensures cross-cutting questions reach the pages designed to answer them. Specific-entity queries don't match these prefixes → no promotion → ordering unchanged.
 
 ### qmd is optional
 

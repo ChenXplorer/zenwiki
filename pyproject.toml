@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zenwiki"
-version = "0.1.0"
+version = "0.1.1"
 description = "Agent-driven enterprise knowledge wiki toolkit"
 readme = "README.md"
 requires-python = ">=3.10"
