@@ -376,6 +376,29 @@ def _preflight_check(
 
 # ─── Batch compilation ────────────────────────────────────────────
 
+def _run_consolidate(
+    root: Path,
+    agent_cmd: str,
+    agent_args: list[str],
+) -> bool:
+    """Run the /consolidate workflow — Agent reviews the full wiki and
+    creates missing comparisons/maps pages. Soft-fails: returns False but
+    does not abort compilation. Called per-batch from compile_once."""
+    console.print("[bold]Consolidating wiki (comparisons/maps)...[/bold]")
+    consolidate_prompt = build_consolidate_prompt(root)
+    ok, _ = _run_agent(
+        [agent_cmd, *agent_args, consolidate_prompt],
+        cwd=root,
+        timeout=_COMPILE_TIMEOUT,
+        label="consolidate",
+    )
+    if ok:
+        console.print("[green]✓ Consolidation pass completed[/green]")
+    else:
+        console.print("[yellow]⚠ Consolidation pass failed (continuing)[/yellow]")
+    return ok
+
+
 def _compile_batch(
     root: Path,
     agent_cmd: str,
@@ -528,6 +551,7 @@ def compile_once(
         return result
 
     # ── Parallel batch compilation ───────────────────────────────
+    threshold = cfg.compile.consolidate_threshold
     if batches:
         total = len(pending_files)
         _abort_event.clear()
@@ -547,11 +571,13 @@ def compile_once(
                 for idx, batch in enumerate(batches)
             }
             for future in as_completed(futures):
+                batch_compiled_count = 0
                 for raw_path, ok, slug in future.result():
                     done_count += 1
                     ts = time.strftime("%H:%M:%S")
                     if ok:
                         result.compiled.append(raw_path)
+                        batch_compiled_count += 1
                         if slug:
                             compiled_slugs[slug] = raw_path
                         console.print(
@@ -564,6 +590,17 @@ def compile_once(
                             f"[dim][{ts}][/dim] [{done_count:3d}/{total}] "
                             f"[red]FAILED[/red]    {raw_path}"
                         )
+
+                # Per-batch consolidate: each batch that contributed N+ compiled
+                # files triggers a consolidation pass so comparisons/maps grow
+                # continuously rather than only once at the end of a bulk run.
+                # Skipped on abort; lint gate still runs once at the end.
+                if (
+                    threshold > 0
+                    and batch_compiled_count >= threshold
+                    and not _abort_event.is_set()
+                ):
+                    _run_consolidate(root, agent_cmd, agent_args)
 
         if _abort_event.is_set():
             result.aborted = True
@@ -605,29 +642,8 @@ def compile_once(
                     f"by lint gate[/yellow]"
                 )
 
-    # ── Consolidation pass (comparisons & maps) ────────────────
-    threshold = cfg.compile.consolidate_threshold
-    if (
-        threshold > 0
-        and len(result.compiled) >= threshold
-        and not result.aborted
-    ):
-        console.print(
-            f"[bold]Consolidating wiki "
-            f"({len(result.compiled)} files compiled >= threshold {threshold}, "
-            f"reviewing comparisons/maps)...[/bold]"
-        )
-        consolidate_prompt = build_consolidate_prompt(root)
-        ok, _ = _run_agent(
-            [agent_cmd, *agent_args, consolidate_prompt],
-            cwd=root,
-            timeout=_COMPILE_TIMEOUT,
-            label="consolidate",
-        )
-        if ok:
-            console.print("[green]✓ Consolidation pass completed[/green]")
-        else:
-            console.print("[yellow]⚠ Consolidation pass failed[/yellow]")
+    # Note: consolidation now runs per-batch inside the executor loop above,
+    # not once at end-of-pass. See _run_consolidate.
 
     # ── Prune deleted sources ────────────────────────────────────
     if removed:

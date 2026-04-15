@@ -24,7 +24,10 @@ class CompileConfig:
     # same-name concept pages cause lost writes. Bump only if you've reviewed
     # the race conditions and accept them.
     concurrency: int = 1  # parallel Agent processes
-    consolidate_threshold: int = 3  # run consolidation after N+ files compiled (0 = never)
+    # Run /consolidate after every batch that compiles N+ files. 1 = after
+    # every successful batch (recommended — keeps comparisons/maps current).
+    # 0 = never auto-consolidate (only `zenwiki consolidate` manually).
+    consolidate_threshold: int = 1
     # Wait this many hours after a raw file disappears before letting --prune
     # touch the corresponding wiki page. Protects against transient absence
     # (git checkout, file moves, accidental deletes).
@@ -70,7 +73,7 @@ def load_config(root: Path) -> Config:
             auto_commit=compile_raw.get("auto_commit", True),
             batch_size=compile_raw.get("batch_size", 2),
             concurrency=compile_raw.get("concurrency", 1),
-            consolidate_threshold=compile_raw.get("consolidate_threshold", 3),
+            consolidate_threshold=compile_raw.get("consolidate_threshold", 1),
             prune_grace_hours=float(compile_raw.get("prune_grace_hours", 24.0)),
             preflight_cache_seconds=int(compile_raw.get("preflight_cache_seconds", 600)),
         ),

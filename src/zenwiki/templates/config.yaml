@@ -9,3 +9,4 @@ compile:
   concurrency: 1             # parallel Agent processes (>1 risks racing on wiki/index.md and log.md)
   prune_grace_hours: 24      # wait this long after a raw file disappears before --prune touches the wiki page
   preflight_cache_seconds: 600  # reuse a successful preflight result for 10 min (saves an LLM call per debounce in --watch mode)
+  consolidate_threshold: 1      # run /consolidate after every batch with this many compiled files (0 = never auto-consolidate)

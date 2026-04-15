@@ -226,7 +226,7 @@ compile:
   auto_commit: true               # git commit after compile
   batch_size: 2                   # files per Agent process
   concurrency: 1                  # parallel Agent processes (>1 risks racing on wiki/index.md, log.md)
-  consolidate_threshold: 3        # run /consolidate after N+ files compiled in a single pass (0 = never)
+  consolidate_threshold: 1        # run /consolidate after every batch with N+ compiled files (0 = never auto-consolidate)
   prune_grace_hours: 24           # wait this long after a raw file disappears before --prune touches the wiki page
   preflight_cache_seconds: 600    # reuse a successful preflight result for 10 min (saves an LLM call per debounce)
 ```
