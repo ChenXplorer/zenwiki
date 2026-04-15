@@ -9,15 +9,13 @@ Agent-driven enterprise knowledge wiki toolkit. Drop files into `raw/`, let an A
 
 ZenWiki does not call any LLM API. It provides deterministic tools (search, dedup, lint, index) that an external Agent (Claude Code or Codex CLI) uses to build and maintain the wiki.
 
-<!--
-Screenshots / demo gif
-─────────────────────────────────────────────────────────────────────
-TODO: add a screenshot of the Web UI's Ask AI flow and Crystallize
-button. Save image under `docs/screenshots/` and uncomment below:
+## Screenshots
 
-![Ask AI](docs/screenshots/ask-ai.png)
-![Crystallize](docs/screenshots/crystallize.png)
--->
+|  |  |
+|---|---|
+| **Browse** — sidebar tree, rendered markdown, frontmatter tags | ![doc view](docs/screenshots/02-doc-view.png) |
+| **Ask AI** — hybrid retrieval + Agent synthesizes with citations | ![ask ai](docs/screenshots/03-ask-ai.png) |
+| **Crystallize** — one-click save Q&A back into `wiki/outputs/` | ![crystallize](docs/screenshots/04-crystallize.png) |
 
 ## How It Works
 
