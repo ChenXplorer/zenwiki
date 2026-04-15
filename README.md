@@ -36,82 +36,102 @@ zenwiki serve  ──→  Agent CLI (claude / codex)
 
 ## Install
 
+### Prerequisites
+
+**Required:**
+- Python 3.10+
+- An Agent CLI: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) **or** [Codex CLI](https://github.com/openai/codex) — and you must be logged in (`claude /login` or `codex login`).
+
+**Optional:**
+- [qmd](https://github.com/tobi/qmd) on `$PATH` → Ask AI uses hybrid BM25 + vector search. Without qmd → falls back to BM25 only. Everything still works.
+- Git — recommended; `codex` additionally requires the project to live inside a git repo.
+
+### Install ZenWiki
+
 ```bash
-pip install -e .
-cd web && npm install   # frontend dependencies
+pip install git+https://github.com/ChenXplorer/zenwiki.git
 ```
 
-Requirements:
-- Python 3.10+
-- Node.js 18+ (for frontend and qmd)
-- One of: [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) or [Codex CLI](https://github.com/openai/codex) (for compilation)
-- [qmd](https://github.com/tobi/qmd) — optional; if installed on `$PATH`, Ask AI uses it for vector search. Without qmd, Ask AI falls back to BM25 only.
+That's it. The Web UI ships inside the wheel, so no `npm install` is needed for end users. (Contributors who modify the frontend: see [CONTRIBUTING.md](./CONTRIBUTING.md).)
 
 ## Quickstart
 
-### 1. Initialize a project
+### 1. Create a project
 
 ```bash
-mkdir my-wiki && cd my-wiki
-zenwiki init .
-git init && git add -A && git commit -m "init"
+zenwiki init my-wiki
+cd my-wiki
 ```
 
-This creates:
+This generates the scaffold:
 
 ```
 my-wiki/
 ├── CLAUDE.md           # Schema for AI agents
 ├── config.yaml         # Configuration
 ├── .zenwiki/           # Internal state (manifest)
-├── raw/                # Source files (you put files here)
-│   ├── papers/
-│   ├── articles/
-│   ├── notes/
-│   └── docs/
-└── wiki/               # Knowledge layer (agent-maintained)
-    ├── index.md
-    ├── log.md
-    ├── summaries/
-    ├── entities/
-    ├── concepts/
-    ├── comparisons/
-    ├── maps/
-    └── outputs/
+├── raw/{papers,articles,notes,docs}/   # You drop source files here
+└── wiki/{summaries,entities,concepts,comparisons,maps,outputs}/   # Agent-maintained output
 ```
 
-### 2. Check environment
+**If you plan to use `codex` as the Agent, also initialize git now** (codex refuses to run outside a git repo):
+
+```bash
+git init -q && git add -A && git commit -q -m "init"
+```
+
+### 2. Verify the environment
 
 ```bash
 zenwiki doctor
 ```
 
-Verifies that config, directories, Agent CLI, qmd, and git are ready.
+You should see green checks for `config.yaml`, `CLAUDE.md`, `raw/`, `wiki/`, and **at least one** of `claude CLI` / `codex CLI`. `qmd` red is fine — Ask AI still works without it.
 
-### 3. Add source files
+### 3. Drop source files into `raw/`
 
 ```bash
-cp ~/papers/*.pdf raw/papers/
-cp ~/tech-docs/*.md raw/articles/
-cp ~/meeting-notes/*.docx raw/notes/
+cp ~/your-files/*.pdf raw/papers/
+cp ~/your-notes/*.md  raw/notes/
 ```
 
-### 4. Start ZenWiki
+**No sources handy?** Grab a public paper to try it end-to-end:
+
+```bash
+curl -L -o raw/papers/attention-is-all-you-need.pdf \
+  https://arxiv.org/pdf/1706.03762.pdf
+```
+
+### 4. Start the server
 
 ```bash
 zenwiki serve
 ```
 
-One command does everything:
-- **API server** (FastAPI) on port 3334
-- **Web UI** (Vite + React) on http://localhost:5173 — auto-opens in browser
-- **Compile watcher** — monitors `raw/` and auto-compiles on file changes
+This launches:
+- **API + Web UI** on `http://127.0.0.1:3334` — the bundled UI is served by FastAPI
+- **Compile watcher** on `raw/` — auto-compiles new/changed files via the Agent CLI
 
-Click the refresh button in the sidebar after compilation finishes to see new pages.
+A browser tab opens automatically. If you installed the package from a cloned repo with `npm install` done, a Vite dev server also starts on `:5173` with hot reload — otherwise just use `:3334`.
 
-The search bar is **Ask AI**: type a question, press Enter (or click **Ask AI**), and ZenWiki retrieves the top relevant wiki pages then calls the Agent CLI to synthesize an answer with source citations.
+### 5. Explore
 
-After the answer returns, a **💎 Crystallize to Wiki** button appears under it. One click writes the Q&A as a new page under `wiki/outputs/` (with citations), updates `index.md` and `log.md`, and refreshes the search index — so the answer is immediately available to future Ask AI queries. See [Crystallizing Ask AI answers](#crystallizing-ask-ai-answers) for the trade-offs.
+Once the watcher finishes compiling your sources (takes a minute or two per file — the Agent actually reads them):
+
+- Click the 🔄 button in the sidebar to refresh the tree
+- Open a summary page to see structured output
+- Use the **Ask AI** search bar (Enter) to query the wiki — the Agent retrieves top-5 pages and synthesizes an answer with citations
+- Click **💎 Crystallize to Wiki** under any answer to save it as a new page under `wiki/outputs/` so future queries can find it
+
+### Troubleshooting the first run
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `zenwiki: command not found` | pip's scripts dir not on PATH | `python -m zenwiki --help`, or add pip's user bin to PATH |
+| Compile hangs silently, no files appear in `wiki/summaries/` | Agent CLI not logged in | `claude /login` or `codex login` — ZenWiki shells out to these and inherits their auth |
+| Compile errors with `Not inside a trusted directory` | You're using codex in a non-git directory | `git init -q` inside the project root, or switch to `claude` (no such requirement) |
+| Browser tab opens but Ask AI returns nothing | Agent CLI failed silently | Check `.zenwiki/compile-runs.jsonl` (per-call audit), or run `zenwiki doctor` |
+| `qmd` shown red in doctor | Not installed | Ignore — Ask AI falls back to BM25 and still works |
 
 ### 5. Manual compile (optional)
 
@@ -143,7 +163,7 @@ Each compiled summary is also passed through a **lint gate** before being marked
 ### 6. Search and explore
 
 ```bash
-# Search wiki content (requires qmd)
+# Search wiki content (BM25 by default; hybrid BM25 + vectors if qmd is installed)
 zenwiki search "flash attention memory optimization"
 
 # Trace a source file to its wiki pages
