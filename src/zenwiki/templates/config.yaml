@@ -1,0 +1,11 @@
+serve:
+  port: 3333
+  bind: "127.0.0.1"
+compile:
+  agent: "auto"              # auto / claude / codex
+  debounce_seconds: 30       # watch mode debounce interval (seconds)
+  auto_commit: true          # git commit after compile
+  batch_size: 2              # files per Agent process
+  concurrency: 1             # parallel Agent processes (>1 risks racing on wiki/index.md and log.md)
+  prune_grace_hours: 24      # wait this long after a raw file disappears before --prune touches the wiki page
+  preflight_cache_seconds: 600  # reuse a successful preflight result for 10 min (saves an LLM call per debounce in --watch mode)
