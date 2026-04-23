@@ -1,0 +1,10 @@
+# Local search/compile caches — regenerated on demand
+.zenwiki/search.db
+.zenwiki/search.db-shm
+.zenwiki/search.db-wal
+.zenwiki/preflight.json
+.zenwiki/dedup-audit.jsonl
+.zenwiki/*.log
+
+# IMPORTANT: .zenwiki/manifest.json IS tracked — it's the compile state
+# the watcher needs across machines. Don't add .zenwiki/ wholesale.

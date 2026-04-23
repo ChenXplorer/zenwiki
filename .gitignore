@@ -1,0 +1,48 @@
+# ─── Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+
+# ─── Node / frontend build ──────────────────────────────────────────
+core/web/node_modules/
+core/web/dist/
+core/web/.vite/
+core/web/tsconfig.tsbuildinfo
+
+# Built frontend artifacts under core/src/zenwiki/static/ ARE tracked on
+# purpose: they ship with the Python wheel and let users `pip install
+# git+...` without needing Node. Rebuild with `cd core/web && npm run build`
+# before committing frontend changes. Accept the diff churn.
+
+# ─── User wiki workspace ────────────────────────────────────────────
+# my-wiki/ is tracked as part of this repo (the content directory).
+# Local-only caches inside it are ignored via my-wiki/.gitignore.
+
+# ─── Editor / OS ────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+
+# ─── Local / private scratch ────────────────────────────────────────
+# Contributor local notes, throwaway scripts, etc.
+scratch/
+*.local.md

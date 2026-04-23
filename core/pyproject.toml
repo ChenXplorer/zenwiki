@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zenwiki"
+version = "0.1.0"
+description = "An implementation of Karpathy's LLM wiki idea — raw sources → agent-compiled wiki → Ask AI"
+readme = "../README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Chen Xplorer", email = "xuzhouchen2019@gmail.com"},
+]
+keywords = ["wiki", "knowledge-base", "llm", "agent", "claude", "codex", "karpathy"]
+dependencies = [
+    "typer",
+    "rich",
+    "pyyaml",
+    "fastapi",
+    "uvicorn",
+    "markdown",
+    "watchdog",
+    "jieba",
+]
+
+[project.urls]
+Homepage = "https://github.com/ChenXplorer/zenwiki"
+Repository = "https://github.com/ChenXplorer/zenwiki"
+Issues = "https://github.com/ChenXplorer/zenwiki/issues"
+
+[project.scripts]
+zenwiki = "zenwiki.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zenwiki"]
+artifacts = [
+    "src/zenwiki/static/**/*",
+]
