@@ -2,7 +2,7 @@ serve:
   port: 3333
   bind: "127.0.0.1"
 compile:
-  agent: "codex"              # auto / claude / codex
+  agent: "auto"               # auto / claude / codex
   debounce_seconds: 30       # watch mode debounce interval (seconds)
   auto_commit: true          # git commit after compile
   batch_size: 2              # files per Agent process
