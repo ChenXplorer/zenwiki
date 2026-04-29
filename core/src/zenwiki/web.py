@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import shutil
 import subprocess
@@ -124,70 +125,54 @@ def create_app(root: Path) -> FastAPI:
 
     @api.get("/query")
     async def query_endpoint(q: str = Query(..., min_length=1)) -> JSONResponse:
-        """Search + AI answer: retrieve relevant wiki pages, then ask Agent CLI to synthesize."""
-        # Retrieve 10 (not 5) so cross-cutting pages like maps/ and
-        # comparisons/ — which often rank 6-10 under BM25 because they list
-        # many entities rather than repeat query tokens — still make it into
-        # the prompt. Deprecated pages are filtered inside hybrid_search so
-        # they can't pollute Ask AI context.
-        results = _wiki_index.hybrid_search(q, limit=10, exclude_deprecated=True)
+        """Search + AI answer: spawn the Agent CLI with the zenwiki-ask
+        skill so it does its own search, reads pages, and synthesizes."""
+        # Local retrieval populates the "results" panel below the answer.
+        # The skill independently re-runs the same search inside the agent;
+        # this duplicate is cheap and keeps the UI's transparency list
+        # working without coupling it to the skill's output schema.
+        local_results = _wiki_index.hybrid_search(q, limit=10, exclude_deprecated=True)
+        results_payload = [
+            {"path": r.path, "score": r.score, "snippet": r.snippet}
+            for r in local_results
+        ]
 
-        if not results:
-            return JSONResponse({"answer": "", "sources": [], "results": []})
+        agent = _detect_query_agent()
+        if agent is None:
+            return JSONResponse({
+                "answer": "", "sources": [], "results": results_payload,
+                "error": "No Agent CLI found (install claude or codex)",
+            })
 
-        pages_content: list[str] = []
-        sources: list[str] = []
-        for r in results[:10]:
-            wiki_path = root / "wiki" / r.path
-            if not wiki_path.exists():
-                continue
-            text = wiki_path.read_text(encoding="utf-8")
-            body = strip_frontmatter(text)
-            pages_content.append(f"--- {r.path} ---\n{body}")
-            sources.append(r.path)
-
-        if not pages_content:
-            return JSONResponse({"answer": "", "sources": [], "results": [
-                {"path": r.path, "score": r.score, "snippet": r.snippet} for r in results
-            ]})
-
-        context = "\n\n".join(pages_content)
-        prompt = (
-            f"Based on the following wiki pages, answer the user's question. "
-            f"Cite source page paths when referencing information. "
-            f"Answer in the same language as the question.\n\n"
-            f"{context}\n\n"
-            f"Question: {q}"
-        )
-
-        agent_cmd, agent_args, use_stdin = _detect_query_agent()
-        if not agent_cmd:
-            return JSONResponse({"answer": "", "sources": sources, "error": "No Agent CLI found", "results": [
-                {"path": r.path, "score": r.score, "snippet": r.snippet} for r in results
-            ]})
+        # `/zenwiki-ask` forces the skill to load even in -p / exec mode,
+        # where description-based auto-trigger is unreliable. Verified via
+        # claude -p experiment in stage 0.
+        prompt = f"/zenwiki-ask {q}"
 
         try:
-            if use_stdin:
-                proc = await asyncio.to_thread(
-                    subprocess.run,
-                    [agent_cmd, *agent_args],
-                    input=prompt, capture_output=True, text=True, timeout=120, cwd=root,
-                )
-            else:
-                proc = await asyncio.to_thread(
-                    subprocess.run,
-                    [agent_cmd, *agent_args, prompt],
-                    capture_output=True, text=True, timeout=120,
-                    cwd=root, stdin=subprocess.DEVNULL,
-                )
-            answer = proc.stdout.strip() if proc.returncode == 0 else ""
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            answer = ""
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                agent.argv(prompt),
+                capture_output=True, text=True, timeout=180,
+                cwd=str(root), stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            return JSONResponse({
+                "answer": "", "sources": [], "results": results_payload,
+                "error": f"Agent failed: {exc.__class__.__name__}",
+            })
 
+        if proc.returncode != 0:
+            return JSONResponse({
+                "answer": "", "sources": [], "results": results_payload,
+                "error": f"Agent exit {proc.returncode}: {proc.stderr[:200]}",
+            })
+
+        parsed = agent.parse(proc.stdout)
         return JSONResponse({
-            "answer": answer,
-            "sources": sources,
-            "results": [{"path": r.path, "score": r.score, "snippet": r.snippet} for r in results],
+            "answer": parsed.get("answer", ""),
+            "sources": parsed.get("sources", []),
+            "results": results_payload,
         })
 
     @api.get("/status")
@@ -270,14 +255,86 @@ def create_app(root: Path) -> FastAPI:
     return api
 
 
-def _detect_query_agent() -> tuple[str | None, list[str], bool]:
-    """Find an Agent CLI for Q&A. Returns (cmd, args, use_stdin)."""
-    codex = shutil.which("codex")
-    if codex:
-        return codex, ["exec"], False
+class _Agent:
+    __slots__ = ("cmd", "pre", "post", "parse")
 
-    claude = shutil.which("claude")
-    if claude:
-        return claude, ["-p", "--bare"], False
+    def __init__(self, cmd: str, pre: list[str], post: list[str], parse):
+        self.cmd = cmd
+        self.pre = pre   # flags BEFORE the prompt positional
+        self.post = post  # flags AFTER the prompt positional
+        self.parse = parse
 
-    return None, [], False
+    def argv(self, prompt: str) -> list[str]:
+        return [self.cmd, *self.pre, prompt, *self.post]
+
+
+def _detect_query_agent() -> "_Agent | None":
+    """Find an Agent CLI for Q&A and return a parser bound to its output
+    format. Claude is preferred because --allowed-tools gives a precise
+    command-level whitelist; codex is a fallback (--full-auto opens the
+    whole workspace and prompt-injection surface is wider — see README's
+    "Security model" section).
+
+    Claude's --allowed-tools is variadic and would greedily consume any
+    positional arg (including the prompt) that follows it. Putting the
+    prompt right after `-p` and the variadic flag last keeps argv
+    unambiguous.
+    """
+    if claude := shutil.which("claude"):
+        return _Agent(
+            cmd=claude,
+            pre=["-p"],
+            post=[
+                "--output-format", "json",
+                "--allowed-tools", "Bash(zenwiki:*),Read",
+            ],
+            parse=_parse_claude_json,
+        )
+
+    if codex := shutil.which("codex"):
+        # Codex path is untested locally — see README warning. Skill
+        # bundle is mirrored at .agents/skills/, but exec output schema
+        # has not been validated against this parser.
+        return _Agent(
+            cmd=codex,
+            pre=["exec", "--full-auto"],
+            post=[],
+            parse=_parse_codex_text,
+        )
+
+    return None
+
+
+def _parse_claude_json(stdout: str) -> dict[str, Any]:
+    """Parse `claude -p --output-format json`. The envelope's `result`
+    field carries the model's final assistant message as a string. The
+    zenwiki-ask skill is instructed to emit a JSON object as that
+    message, so we json-load it once more. If the model violated that
+    contract, fall back to using the raw text as the answer."""
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        return {"answer": "", "sources": []}
+
+    inner = (envelope.get("result") or "").strip()
+    if not inner:
+        return {"answer": "", "sources": []}
+
+    try:
+        parsed = json.loads(inner)
+        if isinstance(parsed, dict):
+            return {
+                "answer": str(parsed.get("answer", "")),
+                "sources": list(parsed.get("sources") or []),
+            }
+    except json.JSONDecodeError:
+        pass
+
+    return {"answer": inner, "sources": []}
+
+
+def _parse_codex_text(stdout: str) -> dict[str, Any]:
+    """Codex exec output parser — UNTESTED on this machine. Until the
+    skill round-trip is validated against codex, treat the entire stdout
+    as plain answer text with no sources. Safe degradation."""
+    return {"answer": stdout.strip(), "sources": []}
