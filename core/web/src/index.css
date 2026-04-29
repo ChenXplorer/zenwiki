@@ -407,6 +407,35 @@ body {
   opacity: 0.6;
   cursor: not-allowed !important;
 }
+.ai-progress {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: color-mix(in srgb, var(--accent) 3%, var(--bg));
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.ai-progress-step {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--text-muted);
+}
+.ai-progress-label {
+  font-weight: 500;
+  color: var(--text);
+  flex-shrink: 0;
+}
+.ai-progress-detail {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .ai-answer {
   margin-top: 12px;
   border: 1px solid var(--accent);

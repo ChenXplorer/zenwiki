@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Body, FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import RAW_SECTIONS, WIKI_SECTIONS
@@ -124,56 +124,38 @@ def create_app(root: Path) -> FastAPI:
         return JSONResponse([{"path": r.path, "score": r.score, "snippet": r.snippet} for r in results])
 
     @api.get("/query")
-    async def query_endpoint(q: str = Query(..., min_length=1)) -> JSONResponse:
-        """Search + AI answer: spawn the Agent CLI with the zenwiki-ask
-        skill so it does its own search, reads pages, and synthesizes."""
-        # Local retrieval populates the "results" panel below the answer.
-        # The skill independently re-runs the same search inside the agent;
-        # this duplicate is cheap and keeps the UI's transparency list
-        # working without coupling it to the skill's output schema.
+    async def query_endpoint(q: str = Query(..., min_length=1)) -> StreamingResponse:
+        """Server-sent event stream for Ask AI. Spawns the Agent CLI with
+        the zenwiki-ask skill, then translates the agent's stream-json
+        events into UI-level progress steps. Codex (no streaming schema
+        validated locally) falls back to a single done event after the
+        subprocess finishes.
+
+        Event sequence (claude path):
+          results  → {results: [{path, score, snippet}, ...]}
+          step     → {kind: 'searching' | 'reading' | 'synthesizing', detail?}
+          done     → {answer, sources}
+          error    → {message}   (terminal; replaces done)
+        """
+        # Local retrieval seeds the results panel before the agent even
+        # starts. The skill re-runs the same search internally; this
+        # duplicate is cheap and keeps transparency working without
+        # coupling UI to the skill's output schema.
         local_results = _wiki_index.hybrid_search(q, limit=10, exclude_deprecated=True)
         results_payload = [
             {"path": r.path, "score": r.score, "snippet": r.snippet}
             for r in local_results
         ]
 
-        agent = _detect_query_agent()
-        if agent is None:
-            return JSONResponse({
-                "answer": "", "sources": [], "results": results_payload,
-                "error": "No Agent CLI found (install claude or codex)",
-            })
-
-        # `/zenwiki-ask` forces the skill to load even in -p / exec mode,
-        # where description-based auto-trigger is unreliable. Verified via
-        # claude -p experiment in stage 0.
-        prompt = f"/zenwiki-ask {q}"
-
-        try:
-            proc = await asyncio.to_thread(
-                subprocess.run,
-                agent.argv(prompt),
-                capture_output=True, text=True, timeout=180,
-                cwd=str(root), stdin=subprocess.DEVNULL,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-            return JSONResponse({
-                "answer": "", "sources": [], "results": results_payload,
-                "error": f"Agent failed: {exc.__class__.__name__}",
-            })
-
-        if proc.returncode != 0:
-            return JSONResponse({
-                "answer": "", "sources": [], "results": results_payload,
-                "error": f"Agent exit {proc.returncode}: {proc.stderr[:200]}",
-            })
-
-        parsed = agent.parse(proc.stdout)
-        return JSONResponse({
-            "answer": parsed.get("answer", ""),
-            "sources": parsed.get("sources", []),
-            "results": results_payload,
-        })
+        return StreamingResponse(
+            _stream_query(q, results_payload, root),
+            media_type="text/event-stream",
+            headers={
+                # Disable buffering at proxies; SSE needs immediate flush.
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @api.get("/status")
     async def status_endpoint() -> JSONResponse:
@@ -256,13 +238,21 @@ def create_app(root: Path) -> FastAPI:
 
 
 class _Agent:
-    __slots__ = ("cmd", "pre", "post", "parse")
+    __slots__ = ("cmd", "pre", "post", "parse", "streaming")
 
-    def __init__(self, cmd: str, pre: list[str], post: list[str], parse):
+    def __init__(
+        self,
+        cmd: str,
+        pre: list[str],
+        post: list[str],
+        parse,
+        streaming: bool,
+    ):
         self.cmd = cmd
         self.pre = pre   # flags BEFORE the prompt positional
         self.post = post  # flags AFTER the prompt positional
         self.parse = parse
+        self.streaming = streaming
 
     def argv(self, prompt: str) -> list[str]:
         return [self.cmd, *self.pre, prompt, *self.post]
@@ -285,41 +275,194 @@ def _detect_query_agent() -> "_Agent | None":
             cmd=claude,
             pre=["-p"],
             post=[
-                "--output-format", "json",
+                "--output-format", "stream-json",
+                # --verbose is required when stream-json is used with -p,
+                # otherwise claude exits with a usage error.
+                "--verbose",
                 "--allowed-tools", "Bash(zenwiki:*),Read",
             ],
-            parse=_parse_claude_json,
+            parse=_translate_claude_stream,
+            streaming=True,
         )
 
     if codex := shutil.which("codex"):
         # Codex path is untested locally — see README warning. Skill
         # bundle is mirrored at .agents/skills/, but exec output schema
-        # has not been validated against this parser.
+        # has not been validated against this parser. Stays non-streaming
+        # until the schema is verified.
         return _Agent(
             cmd=codex,
             pre=["exec", "--full-auto"],
             post=[],
             parse=_parse_codex_text,
+            streaming=False,
         )
 
     return None
 
 
-def _parse_claude_json(stdout: str) -> dict[str, Any]:
-    """Parse `claude -p --output-format json`. The envelope's `result`
-    field carries the model's final assistant message as a string. The
-    zenwiki-ask skill is instructed to emit a JSON object as that
-    message, so we json-load it once more. If the model violated that
-    contract, fall back to using the raw text as the answer."""
-    try:
-        envelope = json.loads(stdout)
-    except json.JSONDecodeError:
-        return {"answer": "", "sources": []}
+def _parse_codex_text(stdout: str) -> dict[str, Any]:
+    """Codex exec output parser — UNTESTED on this machine. Until the
+    skill round-trip is validated against codex, treat the entire stdout
+    as plain answer text with no sources. Safe degradation."""
+    return {"answer": stdout.strip(), "sources": []}
 
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    """Serialize a single SSE frame. Two newlines terminate the frame
+    per the spec; missing them causes the browser EventSource to buffer
+    indefinitely."""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def _stream_query(q: str, results_payload: list[dict], root: Path):
+    """Async generator yielding SSE frames for /query. Three phases:
+    (1) results panel; (2) live progress from the agent's stream-json;
+    (3) terminal done/error. Errors at any phase produce a single
+    `error` frame and the stream ends.
+    """
+    yield _sse("results", {"results": results_payload})
+
+    agent = _detect_query_agent()
+    if agent is None:
+        yield _sse("error", {"message": "No Agent CLI found (install claude or codex)"})
+        return
+
+    # `/zenwiki-ask` is mandatory: Stage-0 confirmed claude -p does NOT
+    # auto-trigger the skill from description alone.
+    prompt = f"/zenwiki-ask {q}"
+    argv = agent.argv(prompt)
+
+    if not agent.streaming:
+        # Codex path: run sync, emit a single done event with the parsed
+        # output. No intermediate progress until codex stream-json schema
+        # is validated.
+        yield _sse("step", {"kind": "searching", "detail": ""})
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                argv, capture_output=True, text=True, timeout=180,
+                cwd=str(root), stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            yield _sse("error", {"message": f"Agent failed: {exc.__class__.__name__}"})
+            return
+        if proc.returncode != 0:
+            yield _sse("error", {"message": f"Agent exit {proc.returncode}: {proc.stderr[:200]}"})
+            return
+        parsed = agent.parse(proc.stdout)
+        yield _sse("done", {"answer": parsed.get("answer", ""), "sources": parsed.get("sources", [])})
+        return
+
+    # Claude streaming path.
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(root),
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+
+    final_envelope: dict[str, Any] | None = None
+    synth_emitted = False
+
+    try:
+        async for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            ui_event = _translate_claude_event(ev, synth_emitted)
+            if ui_event is None:
+                continue
+            kind, payload = ui_event
+            if kind == "synthesizing":
+                synth_emitted = True
+            if kind == "result":
+                final_envelope = ev
+                continue
+            yield _sse("step", payload)
+    except asyncio.CancelledError:
+        proc.kill()
+        raise
+
+    rc = await proc.wait()
+    if rc != 0 and final_envelope is None:
+        err = (await proc.stderr.read()).decode("utf-8", errors="replace")[:200]
+        yield _sse("error", {"message": f"Agent exit {rc}: {err}"})
+        return
+
+    if final_envelope is None:
+        yield _sse("error", {"message": "Agent finished without a result event"})
+        return
+
+    parsed = _translate_claude_stream(final_envelope)
+    yield _sse("done", {"answer": parsed.get("answer", ""), "sources": parsed.get("sources", [])})
+
+
+def _translate_claude_event(
+    ev: dict[str, Any],
+    synth_emitted: bool,
+) -> tuple[str, dict[str, Any]] | None:
+    """Map one stream-json event to a UI-level (kind, payload) pair.
+    Returns None for events that have no UI value (rate-limit pings,
+    hook lifecycle, init handshakes, intermediate tool results). The
+    `result` event is mapped to `("result", {})` so the caller knows
+    to capture the envelope from outside this function.
+
+    Probed schema (stage-0):
+      type=system,subtype=init|hook_started|hook_response  → skip
+      type=rate_limit_event                                → skip
+      type=assistant, content[0].type=thinking             → skip
+      type=assistant, content[0].type=tool_use,name=Bash   → ("searching", {detail})
+      type=assistant, content[0].type=tool_use,name=Read   → ("reading", {detail})
+      type=assistant, content[0].type=text                 → ("synthesizing", {})  (first only)
+      type=user (tool_result)                              → skip
+      type=result                                          → ("result", {})
+    """
+    t = ev.get("type")
+    if t == "result":
+        return "result", {}
+    if t != "assistant":
+        return None
+
+    content = (ev.get("message") or {}).get("content") or []
+    if not isinstance(content, list) or not content:
+        return None
+
+    first = content[0]
+    kind = first.get("type")
+    if kind == "tool_use":
+        name = first.get("name", "")
+        inp = first.get("input") or {}
+        if name == "Bash":
+            return "searching", {
+                "kind": "searching",
+                "detail": str(inp.get("command", ""))[:200],
+            }
+        if name == "Read":
+            return "reading", {
+                "kind": "reading",
+                "detail": str(inp.get("file_path", ""))[:200],
+            }
+        return None
+    if kind == "text" and not synth_emitted:
+        return "synthesizing", {"kind": "synthesizing", "detail": ""}
+    return None
+
+
+def _translate_claude_stream(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Pull the final {answer, sources} out of a stream-json result
+    event. Same envelope shape as `claude -p --output-format json`:
+    `result` is the model's last assistant message as a string, and
+    the skill is instructed to emit that as a JSON object."""
     inner = (envelope.get("result") or "").strip()
     if not inner:
         return {"answer": "", "sources": []}
-
     try:
         parsed = json.loads(inner)
         if isinstance(parsed, dict):
@@ -329,12 +472,4 @@ def _parse_claude_json(stdout: str) -> dict[str, Any]:
             }
     except json.JSONDecodeError:
         pass
-
     return {"answer": inner, "sources": []}
-
-
-def _parse_codex_text(stdout: str) -> dict[str, Any]:
-    """Codex exec output parser — UNTESTED on this machine. Until the
-    skill round-trip is validated against codex, treat the entire stdout
-    as plain answer text with no sources. Safe degradation."""
-    return {"answer": stdout.strip(), "sources": []}

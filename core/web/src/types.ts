@@ -24,9 +24,10 @@ export interface StatusInfo {
   total_raw: number;
 }
 
-export interface QueryResponse {
-  answer: string;
-  sources: string[];
-  results: SearchResult[];
-  error?: string;
-}
+export type QueryStepKind = "searching" | "reading" | "synthesizing";
+
+export type QueryStreamEvent =
+  | { kind: "results"; results: SearchResult[] }
+  | { kind: "step"; step: QueryStepKind; detail: string }
+  | { kind: "done"; answer: string; sources: string[] }
+  | { kind: "error"; message: string };

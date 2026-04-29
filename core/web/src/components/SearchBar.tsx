@@ -1,13 +1,38 @@
-import { useState } from "react";
-import { fetchQuery, crystallize } from "../api";
-import type { SearchResult } from "../types";
+import { useEffect, useRef, useState } from "react";
+import { streamQuery, crystallize } from "../api";
+import type { QueryStepKind, SearchResult } from "../types";
 
 interface Props {
   onSelect: (path: string) => void;
 }
 
+interface ProgressStep {
+  kind: QueryStepKind;
+  detail: string;
+}
+
+const STEP_LABEL: Record<QueryStepKind, string> = {
+  searching: "🔍 Searching",
+  reading: "📄 Reading",
+  synthesizing: "✍️ Synthesizing",
+};
+
 function toDocPath(path: string): string {
   return path.startsWith("wiki/") ? path : `wiki/${path}`;
+}
+
+function shortenDetail(kind: QueryStepKind, detail: string): string {
+  if (!detail) return "";
+  if (kind === "reading") {
+    // Read tool reports absolute paths; trim to wiki-relative for display.
+    const idx = detail.lastIndexOf("/wiki/");
+    if (idx >= 0) return detail.slice(idx + 1);
+    return detail;
+  }
+  // searching: shorten the bash command to just the query argument.
+  const m = detail.match(/zenwiki search\s+"([^"]+)"/);
+  if (m) return m[1];
+  return detail.length > 80 ? detail.slice(0, 77) + "..." : detail;
 }
 
 export default function SearchBar({ onSelect }: Props) {
@@ -20,35 +45,48 @@ export default function SearchBar({ onSelect }: Props) {
   const [asking, setAsking] = useState(false);
   const [crystallizing, setCrystallizing] = useState(false);
   const [crystallizedPath, setCrystallizedPath] = useState<string | null>(null);
+  const [progress, setProgress] = useState<ProgressStep[]>([]);
+  const cancelRef = useRef<(() => void) | null>(null);
 
-  const doAsk = async () => {
+  // If the component unmounts mid-stream, close the EventSource so it
+  // doesn't keep firing handlers on dead state setters.
+  useEffect(() => () => cancelRef.current?.(), []);
+
+  const doAsk = () => {
     const q = query.trim();
     if (!q) return;
+
+    // Cancel any in-flight stream from a previous click.
+    cancelRef.current?.();
+
     setAsking(true);
     setAnswer(null);
     setAnswerSources([]);
     setAnsweredQuestion("");
     setCrystallizedPath(null);
-    setMessage("Thinking...");
+    setMessage(null);
     setResults([]);
-    try {
-      const data = await fetchQuery(q);
-      setResults(data.results || []);
-      if (data.answer) {
-        setAnswer(data.answer);
-        setAnswerSources(data.sources || []);
+    setProgress([]);
+
+    cancelRef.current = streamQuery(q, (ev) => {
+      if (ev.kind === "results") {
+        setResults(ev.results);
+      } else if (ev.kind === "step") {
+        setProgress((p) => [...p, { kind: ev.step, detail: ev.detail }]);
+      } else if (ev.kind === "done") {
+        setAnswer(ev.answer || null);
+        setAnswerSources(ev.sources);
         setAnsweredQuestion(q);
-        setMessage(null);
-      } else if (data.error) {
-        setMessage(data.error);
+        setAsking(false);
+        if (!ev.answer) {
+          setMessage("No answer returned");
+        }
       } else {
-        setMessage(data.results?.length ? null : "No results found");
+        // error
+        setMessage(ev.message);
+        setAsking(false);
       }
-    } catch (err) {
-      setMessage(`Error: ${(err as Error).message}`);
-    } finally {
-      setAsking(false);
-    }
+    });
   };
 
   const doCrystallize = async () => {
@@ -80,6 +118,19 @@ export default function SearchBar({ onSelect }: Props) {
           {asking ? "Thinking..." : "Ask AI"}
         </button>
       </div>
+
+      {asking && progress.length > 0 && !answer && (
+        <div className="ai-progress">
+          {progress.map((s, i) => (
+            <div key={i} className="ai-progress-step">
+              <span className="ai-progress-label">{STEP_LABEL[s.kind]}</span>
+              {s.detail && (
+                <span className="ai-progress-detail">{shortenDetail(s.kind, s.detail)}</span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
 
       {answer && (
         <div className="ai-answer">
