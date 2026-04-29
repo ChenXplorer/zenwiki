@@ -1,6 +1,6 @@
 ---
 title: "ZenWiki 系统时序图 & 触发图"
-date: 2026-04-14
+date: 2026-04-29
 ---
 
 # ZenWiki 系统时序图 & 触发图
@@ -57,10 +57,14 @@ graph TD
     WEB --> MD
 
     SEARCH -.-> |"子进程调用"| QMD["qmd CLI"]
-    COMPILER -.-> |"子进程调用"| AGENT["Agent CLI<br/>(claude / codex)"]
+    COMPILER -.-> |"子进程调用<br/>(/ingest 编译)"| AGENT["Agent CLI<br/>(claude / codex)"]
+    WEB -.-> |"子进程调用<br/>(/query 触发 /zenwiki-ask)"| AGENT
+    AGENT -.-> |"按 description 加载"| SKILL["my-wiki/.claude/skills/<br/>zenwiki-ask/SKILL.md<br/><i>Q&A 工作流</i>"]
+    SKILL -.-> |"在 skill 内调用<br/>zenwiki search/find-similar/..."| CLI
 
     style AGENT fill:#f9f,stroke:#333
     style QMD fill:#f9f,stroke:#333
+    style SKILL fill:#bfb,stroke:#333
 ```
 
 ---
@@ -203,9 +207,11 @@ sequenceDiagram
 
     par 用户浏览
         Browser->>Vite: http://localhost:5173
-        Vite->>API: proxy /tree /doc /search /query /status<br/>/crystallize /rebuild-index /refresh-index
+        Vite->>API: proxy /tree /doc /search /status<br/>/crystallize /rebuild-index /refresh-index
         API-->>Vite: JSON
-        Vite-->>Browser: 渲染页面
+        Vite->>API: proxy /query (EventSource — SSE)
+        API-->>Vite: text/event-stream<br/>(results / step / done)
+        Vite-->>Browser: 渲染页面 + 实时进度
     and 自动编译 (后台)
         Note over Watcher: raw/ 文件变化 → 30s 去抖 → compile_once()
     end
@@ -258,35 +264,56 @@ sequenceDiagram
 
 ## 6. Web UI 查询时序图（Ask AI + Crystallize）
 
-Web UI 搜索栏只有一种交互：**Ask AI**。按 Enter 直接走混合检索 → Agent 合成，没有独立的"关键词搜索"按钮。合成返回后可选 Crystallize 把问答沉淀回 wiki。
+Web UI 搜索栏只有一种交互：**Ask AI**。按 Enter 后 FastAPI 不再"自己拼 prompt"，而是把任务整体外包给 `zenwiki-ask` skill —— spawn `claude -p "/zenwiki-ask <q>"`，把 stream-json 事件翻译成 SSE 推给浏览器。`/zenwiki-ask` 前缀是必需的（stage-0 验证：description 自动匹配在 `-p` 模式不可靠）。合成返回后可选 Crystallize 把问答沉淀回 wiki。
 
 ```mermaid
 sequenceDiagram
     participant User as 用户 (浏览器)
     participant Vite as React 前端
     participant API as FastAPI 后端
-    participant FTS as SQLite FTS5 (.zenwiki/search.db)
+    participant FTS as SQLite FTS5
     participant QMD as qmd vsearch (可选)
-    participant Agent as Agent CLI
+    participant Agent as Agent CLI<br/>(claude / codex)
+    participant Skill as zenwiki-ask skill<br/>(.claude/skills/)
     participant FS as wiki/ 文件系统
 
     Note over User: Ask AI (Enter)
     User->>Vite: 输入问题，按 Enter
-    Vite->>API: GET /query?q=...
-    API->>FTS: hybrid_search(q, limit=5)
+    Vite->>API: GET /query?q=... (EventSource)
+
+    Note over API: ─── 阶段 1: 本地检索 → 结果面板 ───
+    API->>FTS: hybrid_search(q, limit=10,<br/>exclude_deprecated=True,<br/>promote=maps,comparisons)
     par 并行检索
-        FTS->>FTS: BM25 (jieba 分词 + 权重 title:5 tokens:3 path:1)
+        FTS->>FTS: BM25 (jieba + frontmatter 折入 title)
     and
         FTS->>QMD: qmd vsearch (仅当 qmd 在 PATH)
         QMD-->>FTS: JSON 向量结果
     end
-    FTS->>FTS: RRF 融合 (k=60)
-    FTS-->>API: top-5 SearchResult[]
-    API->>FS: 读取 top-5 页面 (跳过 deprecated)
-    API->>API: 拼 context + prompt
-    API->>Agent: subprocess (codex exec | claude -p --bare)
-    Agent-->>API: 答案 (stdout)
-    API-->>Vite: {answer, sources, results}
+    FTS->>FTS: RRF 融合 + 硬位推举 + 过滤 deprecated
+    FTS-->>API: top-10 SearchResult[]
+    API-->>Vite: SSE event: results<br/>{results: [{path, score, snippet}]}
+
+    Note over API: ─── 阶段 2: spawn agent + skill 接管 ───
+    API->>Agent: subprocess.create_subprocess_exec<br/>claude -p "/zenwiki-ask <q>"<br/>--allowed-tools "Bash(zenwiki:*),Read"<br/>--output-format stream-json --verbose
+    Agent->>Skill: 按 /zenwiki-ask 前缀强制加载 SKILL.md
+
+    loop skill 多步检索（典型 3-5 turn）
+        Skill->>Agent: 工具调用 Bash: zenwiki search "<q>" --json ...
+        Agent-->>API: stream-json: assistant tool_use Bash
+        API-->>Vite: SSE event: step {kind: "searching", detail: cmd}
+        Skill->>FS: zenwiki search 子进程 → 读 wiki 页面
+        Skill->>Agent: 工具调用 Read: wiki/<top-K>.md
+        Agent-->>API: stream-json: assistant tool_use Read
+        API-->>Vite: SSE event: step {kind: "reading", detail: path}
+    end
+
+    Skill->>Agent: 综合答案 → emit JSON {answer, sources}
+    Agent-->>API: stream-json: assistant text (首次出现)
+    API-->>Vite: SSE event: step {kind: "synthesizing"}
+    Agent-->>API: stream-json: result envelope
+    API->>API: parse envelope.result 为 inner JSON
+    API-->>Vite: SSE event: done<br/>{answer, sources}
+
     Vite-->>User: 渲染回答 + sources 链接 + 💎 Crystallize 按钮
 
     Note over User: Crystallize (可选)
@@ -300,7 +327,12 @@ sequenceDiagram
     Vite-->>User: ✓ 已沉淀到 outputs/xxx.md
 ```
 
-qmd 不在 PATH 时静默降级为纯 BM25；整条链路依旧可用。
+**几个关键点**：
+
+- **本地检索结果会跑两次**：FastAPI 阶段 1 跑一次给 UI 透明面板用，skill 内部又跑一次给 LLM 综合用。前者廉价（SQLite + 可选 qmd），换来 UI 不耦合 skill 输出 schema。
+- **Codex 路径退化**：`_detect_query_agent` 选到 codex 时不走 stream-json（schema 未实测），改成 `subprocess.run` + 一次性 `done` 事件，无中途 step 进度。
+- **qmd 不在 PATH 时静默降级**为纯 BM25；整条链路依旧可用，只是检索精度下降。
+- **`--allowed-tools` 是变长 flag**：必须放在 prompt 之后，否则会贪婪吞掉 prompt 参数 —— 这是 `_Agent.argv()` 把 prompt 夹在 `pre`（`-p`）和 `post`（`--output-format ...` `--allowed-tools ...`）之间的原因。
 
 ---
 
@@ -349,6 +381,10 @@ graph TB
         git_proc["git<br/>(add / commit)"]
     end
 
+    subgraph "Skill 资产"
+        skill_md["my-wiki/.claude/skills/<br/>zenwiki-ask/SKILL.md"]
+    end
+
     E2 --> pending --> scan
     E2 --> detect --> agent_proc
     E2 --> batch --> verify
@@ -363,7 +399,10 @@ graph TB
     E4 -->|":3334"| API["FastAPI"]
     E4 -->|":5173"| VITE["Vite"]
     API --> searchfn --> qmd_proc
-    API -->|"/query"| agent_proc
+    API -->|"/query → spawn<br/>'/zenwiki-ask <q>'"| agent_proc
+    agent_proc -->|"按 description 加载"| skill_md
+    skill_md -->|"skill 内调用<br/>(子进程)"| E6
+    skill_md -->|"skill 内调用"| E10
 
     E5 --> lintfn
 
@@ -390,6 +429,7 @@ graph TB
     style agent_proc fill:#f9f,stroke:#333
     style qmd_proc fill:#bbf,stroke:#333
     style git_proc fill:#bfb,stroke:#333
+    style skill_md fill:#bfb,stroke:#333
 ```
 
 ---
