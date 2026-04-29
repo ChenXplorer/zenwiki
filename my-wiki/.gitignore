@@ -8,3 +8,18 @@
 
 # IMPORTANT: .zenwiki/manifest.json IS tracked — it's the compile state
 # the watcher needs across machines. Don't add .zenwiki/ wholesale.
+
+# ─── Agent skills + permissions are product files ──────────────────
+# Repo-root .gitignore ignores .claude/ for Claude Code's local state,
+# but the skill bundle and permission allowlist live with the wiki and
+# must be tracked. Same for the .agents/ symlink Codex reads.
+!.claude/
+!.claude/skills/
+!.claude/skills/**
+!.claude/settings.json
+!.agents/
+!.agents/skills
+# Local-only Claude state stays ignored
+.claude/settings.local.json
+.claude/projects/
+.claude/transcripts/
