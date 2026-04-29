@@ -203,21 +203,46 @@ No search engine required. The Agent itself is the retriever. This works well at
 
 ### Path 2: Web UI Ask AI
 
-The search bar in the Web UI is a single **Ask AI** flow:
+The search bar in the Web UI is a single **Ask AI** flow. It does **not** stuff a prompt server-side — it spawns the Agent CLI and lets the `zenwiki-ask` skill drive the loop:
 
 ```
 User question
-  → SQLite FTS5 (BM25) + qmd vsearch (if qmd is installed), merged via RRF
-  → top-10 wiki pages fetched (deprecated pages filtered out)
-  → Agent CLI synthesizes an answer via subprocess (codex exec | claude -p --bare)
-  → returned with source citations
+  → /query (SSE stream)
+       ├─ frame 1: results       — local hybrid search seeds the panel
+       ├─ frame 2..N: step       — searching / reading / synthesizing
+       │                           (translated from claude stream-json events)
+       └─ frame N+1: done        — {answer, sources}
+  → spawn:  claude -p "/zenwiki-ask <q>" --output-format stream-json
+            --allowed-tools "Bash(zenwiki:*),Read"
+       └─ skill internally calls:
+            zenwiki search "<q>" --exclude-deprecated --promote maps,comparisons
+            Read wiki/<top-K>.md
+            (synthesize, emit JSON {answer, sources})
 ```
 
-There is no separate keyword-search button: every query goes through Ask AI. A plain `zenwiki search "<q>"` CLI remains available for scripting.
+No keyword-only search button: every query goes through Ask AI. Plain `zenwiki search "<q>" --json` is available for scripting.
+
+The skill bundle ships under `my-wiki/.claude/skills/zenwiki-ask/SKILL.md` and is mirrored at `my-wiki/.agents/skills/` (symlink) so Codex CLI finds it too. The browser shows live progress as `🔍 Searching → 📄 Reading wiki/foo.md → ✍️ Synthesizing` — about 17 seconds of previously-blank wait becomes visible.
+
+> **`/zenwiki-ask` prefix is mandatory** for non-interactive runs. Stage-0 testing showed `claude -p "<q>"` does NOT auto-trigger the skill from description alone (1 turn, no tool use, generic answer). The slash prefix forces invocation deterministically.
 
 **Retrieval biases tuned for the Karpathy pattern:**
 - Semantic frontmatter fields (`tags`, `key_concepts`, `key_entities`, `subjects`, `key_sources`, `related_concepts`, `category`) are folded into the FTS title column (BM25 weight 5.0). This fixes the common case where a map page has an English title but Chinese tags (or vice versa) — its declared coverage becomes searchable.
 - `maps/` and `comparisons/` pages get a **hard slot** in hybrid search results: if at least one matches the query but neither made the RRF top-10, the best match of each prefix is swapped in. This corrects for the structural BM25 disadvantage of directory-style pages (short body, long frontmatter lists) and ensures cross-cutting questions reach the pages designed to answer them. Specific-entity queries don't match these prefixes → no promotion → ordering unchanged.
+
+### Security model — Claude vs Codex
+
+Both agents are supported (BYOA), but they don't carry the same risk profile when spawned non-interactively from the Web UI subprocess. Pick what matters to you:
+
+| | Claude Code | Codex CLI |
+|---|---|---|
+| Tool whitelist | `--allowed-tools "Bash(zenwiki:*),Read"` — **command-level** allowlist | `--full-auto` — workspace-wide write, no command granularity |
+| trusted-directory check | none | enforced (must be a git repo) |
+| Output schema | `--output-format stream-json` — validated, used for live progress | not validated locally; falls back to a single `done` frame after completion |
+| Prompt-injection blast radius | bounded to `zenwiki *` + Read | wide (any file write / shell command) |
+| Default in `_detect_query_agent` | preferred | fallback |
+
+**Claude is the recommended path.** Codex works but is marked experimental in the code: the parser is a stub (`_parse_codex_text`) returning raw stdout as the answer with no sources, and there are no fine-grained tool restrictions to absorb a malicious prompt. If you run Codex against an untrusted wiki (e.g. raw sources you don't fully trust), do it knowing the agent has workspace-wide write access for the duration of the call.
 
 ### qmd is optional
 
@@ -302,22 +327,26 @@ zenwiki lint --fix      # auto-fix what can be auto-fixed (currently: missing ti
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  zenwiki serve                                               │
-│                                                              │
-│  ┌──────────┐  ┌──────────────────┐  ┌────────────────────┐  │
-│  │ API      │  │ Compile Watcher  │  │ Vite Dev Server    │  │
-│  │ (FastAPI)│  │ raw/ → Agent CLI │  │ (React frontend)   │  │
-│  │ :3334    │  │  → lint gate     │  │ :5173              │  │
-│  └──────────┘  └──────────────────┘  └────────────────────┘  │
-│       ▲                 │                    │ proxy /tree   │
-│       │                 ▼                    │ proxy /doc    │
-│       │           Agent CLI                  │ proxy /search │
-│       │           (1 worker default;         │ proxy /query  │
-│       │            cached preflight)         │ proxy /status │
-│       │                                      │ /crystallize  │
-│       └──────────────────────────────────────┘               │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  zenwiki serve                                                   │
+│                                                                  │
+│  ┌──────────────┐  ┌────────────────┐  ┌────────────────────┐    │
+│  │ API          │  │ Compile        │  │ Vite Dev Server    │    │
+│  │ (FastAPI)    │  │ Watcher        │  │ (React frontend)   │    │
+│  │ :3334        │  │ raw/ → Agent   │  │ :5173              │    │
+│  │              │  │  → lint gate   │  │                    │    │
+│  └──────┬───────┘  └────────────────┘  └────────┬───────────┘    │
+│         │ /query (SSE)                          │ proxy *        │
+│         ▼                                       ▼                │
+│  ┌─────────────────────────────────┐  EventSource consumes:      │
+│  │ spawn agent CLI:                │   results, step, done       │
+│  │   claude -p "/zenwiki-ask <q>"  │                             │
+│  │   --allowed-tools "Bash(zenwiki:*),Read"                      │
+│  │   --output-format stream-json   │                             │
+│  └──────────────┬──────────────────┘                             │
+│                 │ skill orchestrates:                            │
+│                 ▼  zenwiki search → Read → synthesize → JSON     │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## References
