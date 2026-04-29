@@ -65,14 +65,41 @@ def status(
 def search_cmd(
     query: str = typer.Argument(..., help="Search query"),
     limit: int = typer.Option(10, "--limit", "-n", help="Max results"),
+    exclude_deprecated: bool = typer.Option(
+        False,
+        "--exclude-deprecated",
+        help="Drop pages whose frontmatter has `deprecated: true`",
+    ),
+    promote: str = typer.Option(
+        "maps,comparisons",
+        "--promote",
+        help="Comma-separated wiki section prefixes to guarantee one slot for "
+             "(e.g. 'maps,comparisons'). Use 'none' or '' to disable promotion.",
+    ),
     path: Optional[Path] = typer.Option(None, "--path", "-p", help="Project root"),
 ) -> None:
     """Search wiki pages using hybrid BM25 + vector search (returns JSON)."""
     root = _root(path)
     from .search import WikiIndex
     index = WikiIndex(root / "wiki")
-    results = index.hybrid_search(query, limit=limit)
+    results = index.hybrid_search(
+        query,
+        limit=limit,
+        promote_prefixes=_parse_promote(promote),
+        exclude_deprecated=exclude_deprecated,
+    )
     typer.echo(json.dumps([{"path": r.path, "score": r.score, "snippet": r.snippet} for r in results], ensure_ascii=False, indent=2))
+
+
+def _parse_promote(promote: str) -> tuple[str, ...]:
+    """Parse '--promote' into normalized prefix tuple. 'none' / '' → ()."""
+    if not promote or promote.strip().lower() == "none":
+        return ()
+    return tuple(
+        f"{p.strip().rstrip('/')}/"
+        for p in promote.split(",")
+        if p.strip()
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -128,8 +128,9 @@ def create_app(root: Path) -> FastAPI:
         # Retrieve 10 (not 5) so cross-cutting pages like maps/ and
         # comparisons/ — which often rank 6-10 under BM25 because they list
         # many entities rather than repeat query tokens — still make it into
-        # the prompt.
-        results = _wiki_index.hybrid_search(q, limit=10)
+        # the prompt. Deprecated pages are filtered inside hybrid_search so
+        # they can't pollute Ask AI context.
+        results = _wiki_index.hybrid_search(q, limit=10, exclude_deprecated=True)
 
         if not results:
             return JSONResponse({"answer": "", "sources": [], "results": []})
@@ -141,9 +142,6 @@ def create_app(root: Path) -> FastAPI:
             if not wiki_path.exists():
                 continue
             text = wiki_path.read_text(encoding="utf-8")
-            # Skip deprecated pages — they must not pollute Ask AI context.
-            if parse_frontmatter(text).get("deprecated") is True:
-                continue
             body = strip_frontmatter(text)
             pages_content.append(f"--- {r.path} ---\n{body}")
             sources.append(r.path)

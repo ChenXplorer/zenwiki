@@ -401,19 +401,31 @@ class WikiIndex:
             log.warning("qmd vsearch error: %s", exc)
             return []
 
-    def hybrid_search(self, query: str, limit: int = 10) -> list[SearchResult]:
+    def hybrid_search(
+        self,
+        query: str,
+        limit: int = 10,
+        promote_prefixes: tuple[str, ...] | None = None,
+        exclude_deprecated: bool = False,
+    ) -> list[SearchResult]:
         """Hybrid search: BM25 keyword + vector semantic, merged via RRF.
         Falls back to BM25-only if qmd is unavailable or fails.
 
-        After the merge, reserves at most one slot for the best-matching
-        `maps/` page and one for the best `comparisons/` page if those
-        match the query at all. Map and comparison pages are "directory-
+        After the merge, reserves at most one slot per prefix in
+        `promote_prefixes` (default: maps/ and comparisons/) when such a
+        page matches the query. Map and comparison pages are "directory-
         style" (short body, long frontmatter) and consistently under-rank
         on raw BM25, yet they're the highest-value sources for cross-
-        cutting questions like "what products cover X?". The hard slot
-        corrects for this structural bias without distorting ordering
-        for specific lookups (where neither type will match).
+        cutting questions. Pass an empty tuple to disable promotion.
+
+        `exclude_deprecated=True` drops pages whose frontmatter has
+        `deprecated: true`. The check happens after promotion, so a
+        promoted-then-stripped slot may shrink the result list below
+        `limit` — acceptable since promoted candidates are rarely
+        deprecated.
         """
+        prefixes = self._PROMOTE_PREFIXES if promote_prefixes is None else promote_prefixes
+
         bm25_results = self.search(query, limit=limit * 2)
 
         if not self._qmd:
@@ -425,27 +437,47 @@ class WikiIndex:
             else:
                 base = _rrf_merge(bm25_results, vec_results, limit=limit)
 
-        return self._promote_type_pages(base, query, limit)
+        promoted = self._promote_type_pages(base, query, limit, prefixes)
 
-    # Page prefixes that earn a guaranteed slot in hybrid_search results
-    # when they match the query at all. Order matters: the first promoted
-    # type displaces the last non-privileged slot, the second displaces
-    # the next-last, and so on.
+        if exclude_deprecated:
+            promoted = [r for r in promoted if not self._is_deprecated(r.path)]
+
+        return promoted
+
+    # Default page prefixes that earn a guaranteed slot in hybrid_search
+    # results when they match the query at all. Order matters: the first
+    # promoted type displaces the last non-privileged slot, the second
+    # displaces the next-last, and so on.
     _PROMOTE_PREFIXES = ("maps/", "comparisons/")
+
+    def _is_deprecated(self, rel_path: str) -> bool:
+        p = self._wiki_dir / rel_path
+        if not p.is_file():
+            return False
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        return parse_frontmatter(text).get("deprecated") is True
 
     def _promote_type_pages(
         self,
         base: list[SearchResult],
         query: str,
         limit: int,
+        prefixes: tuple[str, ...],
     ) -> list[SearchResult]:
-        """If `base` lacks any maps/ or comparisons/ page, and such a page
-        matches the query, swap it in for the lowest-ranked non-privileged
-        slot. Idempotent — already-present privileged pages are untouched."""
+        """If `base` lacks any page under one of `prefixes`, and such a
+        page matches the query, swap it in for the lowest-ranked non-
+        privileged slot. Idempotent — already-present privileged pages
+        are untouched. Empty `prefixes` is a no-op."""
+        if not prefixes:
+            return base[:limit]
+
         have_paths = {r.path for r in base}
         promoted = list(base)
 
-        for prefix in self._PROMOTE_PREFIXES:
+        for prefix in prefixes:
             if any(p.startswith(prefix) for p in have_paths):
                 continue
             top = self.search(query, limit=1, path_prefix=prefix)
@@ -458,7 +490,7 @@ class WikiIndex:
             for idx in range(len(promoted) - 1, -1, -1):
                 if not any(
                     promoted[idx].path.startswith(p)
-                    for p in self._PROMOTE_PREFIXES
+                    for p in prefixes
                 ):
                     promoted[idx] = candidate
                     have_paths.add(candidate.path)
